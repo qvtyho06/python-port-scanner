@@ -35,6 +35,18 @@ STATUS_CLOSED = "closed"
 STATUS_FILTERED = "filtered"
 STATUS_ERROR = "error"
 
+# getservbyport() returns a pointer to static libc storage, so serialize it.
+_SERVICE_LOOKUP_LOCK = threading.Lock()
+
+@dataclass
+class PortResult:
+    """Outcome of probing a single TCP port."""
+
+    port: int
+    status: str
+    service: str = ""
+    banner: str = ""
+
 # --------------------------------------------------------------------------
 # CLI parsing
 # --------------------------------------------------------------------------
@@ -132,11 +144,70 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     return parser.parse_args(argv)
 
+
+# --------------------------------------------------------------------------
+# Scanning engine
+# --------------------------------------------------------------------------
+
+def resolve_target(target: str) -> str:
+    """Resolve a hostname to an IPv4 address.
+
+    Raises:
+        socket.gaierror: If the name cannot be resolved.
+    """
+    return socket.gethostbyname(target.strip())
+
+
+def lookup_service(port: int) -> str:
+    """Return the well-known TCP service name for a port, or 'unknown'."""
+    with _SERVICE_LOOKUP_LOCK:
+        try:
+            return socket.getservbyport(port, "tcp")
+        except OSError:
+            return "unknown"
+
+def scan_port(
+    ip: str,
+    port: int,
+    probe_host: bytes,
+    timeout: float,
+    stop_event: threading.Event,
+) -> Optional[PortResult]:
+    """Perform a TCP connect scan of one port and grab its banner if open.
+
+    Returns:
+        A PortResult, or None if the scan was cancelled before it started.
+    """
+    if stop_event.is_set():
+        return None
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            try:
+                sock.connect((ip, port))
+            except socket.timeout:
+                return PortResult(port, STATUS_FILTERED)
+            except ConnectionRefusedError:
+                return PortResult(port, STATUS_CLOSED)
+            except OSError:
+                # Host/network unreachable, ICMP prohibited, etc.
+                return PortResult(port, STATUS_FILTERED)
+            banner = "" 
+    except OSError:
+        # Socket creation failed, e.g. the process ran out of file handles.
+        return PortResult(port, STATUS_ERROR)
+    return PortResult(port, STATUS_OPEN, lookup_service(port), banner)
+
 def main():
     args = parse_args()
-    print(f"Target: {args.target}")
-    print(f"Ports to scan: {len(args.ports)} ports, first port: {args.ports[0]}")
-    print(f"Workers: {args.workers}")
+    ip = resolve_target(args.target)
+    print(f"Scanning IP: {ip}")
+    
+    stop_event = threading.Event()
+    # Test first 10 ports for demonstration purposes
+    for port in args.ports[:10]:
+        result = scan_port(ip, port, b"", args.timeout, stop_event)
+        print(f"Port {result.port}: {result.status} ({result.service})")
 
 if __name__ == "__main__":
     main()
