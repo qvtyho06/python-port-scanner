@@ -6,6 +6,8 @@ import socket
 import sys
 import threading
 import time
+import ipaddress
+import subprocess
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -337,6 +339,20 @@ def run_scan(
         if sys.stderr.isatty() and not interrupted:
             print(file=sys.stderr)
     return interrupted
+
+def ping_host(ip_obj: ipaddress.IPv4Address) -> Optional[str]:
+    """Ping a single IP. Return the IP as a string if it responds, else None."""
+    # -n 1: Send one packet. -W 1: Wait up to 1 second for a reply.
+    # Note: If running on Linux natively, use "-c 1" and "-w 1000" instead.
+    command = ["ping", "-n", "1", "-W", "1", str(ip_obj)]
+    
+    try:
+        result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if result.returncode == 0:
+            return str(ip_obj)
+    except OSError:
+        pass
+    return None
 
 # --------------------------------------------------------------------------
 # Output
