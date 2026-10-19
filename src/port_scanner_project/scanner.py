@@ -47,6 +47,24 @@ class PortResult:
     service: str = ""
     banner: str = ""
 
+class ResultCollector:
+    """Thread-safe container that worker threads append results to."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._results: List[PortResult] = []
+
+    def add(self, result: PortResult) -> None:
+        """Append a result while holding the lock."""
+        with self._lock:
+            self._results.append(result)
+
+    def snapshot(self) -> List[PortResult]:
+        """Return a port-sorted copy of all results collected so far."""
+        with self._lock:
+            return sorted(self._results, key=lambda r: r.port)
+
+
 # --------------------------------------------------------------------------
 # CLI parsing
 # --------------------------------------------------------------------------
@@ -197,6 +215,82 @@ def scan_port(
         # Socket creation failed, e.g. the process ran out of file handles.
         return PortResult(port, STATUS_ERROR)
     return PortResult(port, STATUS_OPEN, lookup_service(port), banner)
+
+def _scan_worker(
+    ip: str,
+    port: int,
+    probe_host: bytes,
+    timeout: float,
+    stop_event: threading.Event,
+    collector: ResultCollector,
+) -> None:
+    """Thread entry point: scan one port and store the result."""
+    result = scan_port(ip, port, probe_host, timeout, stop_event)
+    if result is not None:
+        collector.add(result)
+
+
+def _print_progress(done: int, total: int) -> None:
+    """Show an in-place progress line on stderr when it is a terminal."""
+    if sys.stderr.isatty():
+        percent = done * 100 / total
+        print(f"\r[*] Progress: {done}/{total} ports ({percent:5.1f}%)",
+              end="", file=sys.stderr, flush=True)
+
+
+def run_scan(
+    ip: str,
+    probe_host: bytes,
+    ports: Sequence[int],
+    workers: int,
+    timeout: float,
+    collector: ResultCollector,
+) -> bool:
+    """Scan all ports concurrently with a ThreadPoolExecutor.
+
+    The main thread waits in short slices so Ctrl+C is delivered promptly on
+    every platform. On interrupt, queued ports are cancelled, in-flight
+    probes are told to skip banner grabbing, and the pool is drained (each
+    in-flight probe is bounded by its socket timeouts).
+
+    Returns:
+        True if the scan was interrupted by the user, False otherwise.
+    """
+    stop_event = threading.Event()
+    executor = ThreadPoolExecutor(max_workers=workers,
+                                  thread_name_prefix="scanner")
+    pending: Set[Future[None]] = {
+        executor.submit(_scan_worker, ip, port, probe_host, timeout,
+                        stop_event, collector)
+        for port in ports
+    }
+    total = len(pending)
+    interrupted = False
+    try:
+        while pending:
+            done, pending = wait(pending, timeout=0.2,
+                                 return_when=FIRST_COMPLETED)
+            for future in done:
+                error = future.exception()
+                if error is not None:
+                    print(f"\n[!] Worker error: {error!r}", file=sys.stderr)
+            _print_progress(total - len(pending), total)
+    except KeyboardInterrupt:
+        interrupted = True
+        stop_event.set()
+        print("\n[!] Interrupted: cancelling queued ports and waiting for "
+              "in-flight probes to finish...", file=sys.stderr)
+        executor.shutdown(wait=False, cancel_futures=True)
+    finally:
+        try:
+            executor.shutdown(wait=True)
+        except KeyboardInterrupt:
+            interrupted = True
+            print("[!] Forced exit; skipped waiting for remaining threads.",
+                  file=sys.stderr)
+        if sys.stderr.isatty() and not interrupted:
+            print(file=sys.stderr)
+    return interrupted
 
 def main():
     args = parse_args()
