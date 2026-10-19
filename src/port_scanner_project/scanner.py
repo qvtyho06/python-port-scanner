@@ -184,6 +184,52 @@ def lookup_service(port: int) -> str:
         except OSError:
             return "unknown"
 
+def clean_banner(raw: bytes) -> str:
+    """Turn raw banner bytes into a single printable line.
+
+    HTTP responses are summarised as the status line plus the ``Server``
+    header (when present); anything else is flattened to one line with
+    control characters removed.
+    """
+    text = raw.decode("utf-8", errors="replace")
+    if text.startswith("HTTP/"):
+        lines = text.splitlines()
+        summary = lines[0].strip()
+        for line in lines[1:]:
+            if line.lower().startswith("server:"):
+                summary += f" | {line.strip()}"
+                break
+        text = summary
+    printable = "".join(ch if ch.isprintable() else " " for ch in text)
+    return " ".join(printable.split())
+
+
+def grab_banner(sock: socket.socket, probe_host: bytes) -> str:
+    """Try to read a service banner from an already-connected socket.
+
+    First waits passively for services that announce themselves on connect.
+    If nothing arrives before the timeout, sends an HTTP GET probe and reads
+    the reply. Every ``recv`` is bounded by a socket timeout, so this never
+    hangs; any socket error simply yields an empty banner.
+    """
+    try:
+        sock.settimeout(PASSIVE_BANNER_TIMEOUT)
+        data = sock.recv(BANNER_MAX_BYTES)
+        # b"" means the peer closed the connection without sending anything.
+        return clean_banner(data) if data else ""
+    except socket.timeout:
+        pass
+    except OSError:
+        return ""
+
+    try:
+        sock.settimeout(PROBE_BANNER_TIMEOUT)
+        sock.sendall(HTTP_PROBE_TEMPLATE % probe_host)
+        data = sock.recv(BANNER_MAX_BYTES)
+    except OSError:  # includes socket.timeout
+        return ""
+    return clean_banner(data)
+
 def scan_port(
     ip: str,
     port: int,
@@ -295,13 +341,14 @@ def run_scan(
 def main():
     args = parse_args()
     ip = resolve_target(args.target)
-    print(f"Scanning IP: {ip}")
+    collector = ResultCollector()
+    print("Starting threaded scan...")
+    # Use an empty byte string for the probe host, since we don't send any probes in this version.
+    run_scan(ip, b"", args.ports, args.workers, args.timeout, collector)
     
-    stop_event = threading.Event()
-    # Test first 10 ports for demonstration purposes
-    for port in args.ports[:10]:
-        result = scan_port(ip, port, b"", args.timeout, stop_event)
-        print(f"Port {result.port}: {result.status} ({result.service})")
+    results = collector.snapshot()
+    open_ports = [r for r in results if r.status == STATUS_OPEN]
+    print(f"\nFound {len(open_ports)} open ports.")
 
 if __name__ == "__main__":
     main()
