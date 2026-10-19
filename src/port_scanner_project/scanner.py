@@ -338,17 +338,148 @@ def run_scan(
             print(file=sys.stderr)
     return interrupted
 
-def main():
-    args = parse_args()
-    ip = resolve_target(args.target)
+# --------------------------------------------------------------------------
+# Output
+# --------------------------------------------------------------------------
+
+def _truncate(text: str, width: int) -> str:
+    """Shorten text to at most ``width`` characters, adding an ellipsis."""
+    return text if len(text) <= width else text[: width - 3] + "..."
+
+
+def print_table(open_results: Sequence[PortResult]) -> None:
+    """Print open ports as an ASCII table: Port | Status | Banner/Service."""
+    if not open_results:
+        print("\nNo open ports found.")
+        return
+
+    headers = ("PORT", "STATUS", "SERVICE / BANNER")
+    rows = []
+    for result in open_results:
+        cell = result.service
+        if result.banner:
+            cell = f"{result.service}: {result.banner}"
+        rows.append((f"{result.port}/tcp", result.status,
+                     _truncate(cell, BANNER_DISPLAY_WIDTH)))
+
+    widths = [max(len(headers[i]), *(len(row[i]) for row in rows))
+              for i in range(len(headers))]
+    border = "+" + "+".join("-" * (w + 2) for w in widths) + "+"
+
+    def fmt(cells: Sequence[str]) -> str:
+        return "| " + " | ".join(c.ljust(w) for c, w in zip(cells, widths)) + " |"
+
+    print()
+    print(border)
+    print(fmt(headers))
+    print(border)
+    for row in rows:
+        print(fmt(row))
+    print(border)
+
+
+def save_json(path: str, report: Dict[str, Any]) -> None:
+    """Write the scan report to ``path`` as pretty-printed JSON.
+
+    Raises:
+        OSError: If the file cannot be written.
+    """
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+
+
+def build_report(
+    target: str,
+    ip: str,
+    ports: Sequence[int],
+    results: Sequence[PortResult],
+    started: datetime,
+    finished: datetime,
+    duration: float,
+    interrupted: bool,
+) -> Dict[str, Any]:
+    """Assemble the structured report saved with ``--output``."""
+    return {
+        "target": target,
+        "ip": ip,
+        "scan_started": started.isoformat(timespec="seconds"),
+        "scan_finished": finished.isoformat(timespec="seconds"),
+        "duration_seconds": round(duration, 2),
+        "ports_requested": len(ports),
+        "ports_scanned": len(results),
+        "interrupted": interrupted,
+        "open_ports": [asdict(r) for r in results if r.status == STATUS_OPEN],
+    }
+
+
+def _probe_host_bytes(target: str, ip: str) -> bytes:
+    """Encode the HTTP Host header value, falling back to the IP address."""
+    try:
+        return target.strip().encode("idna")
+    except UnicodeError:
+        return ip.encode("ascii")
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Run the scanner from the command line and return an exit code."""
+    # Never crash on banners containing characters the console can't encode.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
+
+    args = parse_args(argv)
+    ports: List[int] = args.ports
+
+    try:
+        ip = resolve_target(args.target)
+    except (socket.gaierror, UnicodeError) as exc:
+        print(f"[-] Could not resolve {args.target!r}: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"[*] Target : {args.target} ({ip})")
+    print(f"[*] Ports  : {len(ports)} ({ports[0]}-{ports[-1]})")
+    print(f"[*] Workers: {args.workers} | Timeout: {args.timeout}s")
+
     collector = ResultCollector()
-    print("Starting threaded scan...")
-    # Use an empty byte string for the probe host, since we don't send any probes in this version.
-    run_scan(ip, b"", args.ports, args.workers, args.timeout, collector)
-    
+    started = datetime.now(timezone.utc)
+    clock = time.perf_counter()
+    interrupted = run_scan(ip, _probe_host_bytes(args.target, ip), ports,
+                           args.workers, args.timeout, collector)
+    duration = time.perf_counter() - clock
+    finished = datetime.now(timezone.utc)
+
     results = collector.snapshot()
-    open_ports = [r for r in results if r.status == STATUS_OPEN]
-    print(f"\nFound {len(open_ports)} open ports.")
+    open_results = [r for r in results if r.status == STATUS_OPEN]
+    print_table(open_results)
+
+    counts = {status: sum(1 for r in results if r.status == status)
+              for status in (STATUS_OPEN, STATUS_CLOSED, STATUS_FILTERED,
+                             STATUS_ERROR)}
+    state = "Partial scan" if interrupted else "Scan complete"
+    print(f"\n[*] {state}: {len(results)}/{len(ports)} ports in "
+          f"{duration:.2f}s | open: {counts[STATUS_OPEN]}, "
+          f"closed: {counts[STATUS_CLOSED]}, "
+          f"filtered: {counts[STATUS_FILTERED]}"
+          + (f", errors: {counts[STATUS_ERROR]}" if counts[STATUS_ERROR] else ""))
+
+    if args.output:
+        report = build_report(args.target, ip, ports, results, started,
+                              finished, duration, interrupted)
+        try:
+            save_json(args.output, report)
+        except OSError as exc:
+            print(f"[-] Could not write {args.output!r}: {exc}",
+                  file=sys.stderr)
+            return 1
+        print(f"[+] Results saved to {args.output}")
+
+    return 130 if interrupted else 0
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print("\n[!] Aborted by user.", file=sys.stderr)
+        sys.exit(130)
